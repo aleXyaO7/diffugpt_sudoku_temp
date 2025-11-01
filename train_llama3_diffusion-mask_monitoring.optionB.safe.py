@@ -23,6 +23,8 @@ import transformers.models.llama.modeling_llama as modeling_llama  # noqa: F401
 from packages.packed_dataset import PackedDataset
 from tqdm import tqdm
 from packages.custom_tokenizer import CustomTokenizer
+from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
+
 
 
 # --------------------------- masking helpers ---------------------------
@@ -147,10 +149,53 @@ def patch_model_for_bidirectional_training(model):
             layer.attn.is_causal = False
     model.config.use_cache = False
  
- 
- 
- 
     print("✅ Causal mask cleared – RoPE intact")
+
+def patch_GPT2_model_for_bidirectional_training(model):
+    model.config.use_cache = False
+    if hasattr(model, "model"):
+        model.model.use_cache = False
+
+    #Patch the model for bidirectional (non-causal) attention
+    print("Patching model for bidirectional attention...")
+    for i, layer in enumerate(model.transformer.h):
+        attn = layer.attn
+
+        # It removes the causal mask for the "eager" attn_implementation
+        if hasattr(attn, "bias"):
+            attn.bias.data.fill_(True)
+
+        # for newer "sdpa" or "flash_attention_2" implementations
+        if hasattr(attn, "is_causal"):
+            attn.is_causal = False
+
+        # just in case the layer has is_causal
+        if hasattr(layer, "is_causal"):
+            layer.is_causal = False
+
+    print("✅ Patched model for bidirectional attention: set attn.bias to True and is_causal=False.")
+
+def check_attention(model, tokenizer):
+    # === Debug: check whether attention is bidirectional ===
+    model.config.output_attentions = True  # <== critical
+    tok = tokenizer
+
+    # Use a short sequence of real tokens
+    sample_text = "A B C"
+    inp = tok.encode(sample_text, return_tensors="pt")
+    mask = torch.ones_like(inp)
+
+    with torch.no_grad():
+        out = model(inp, attention_mask=mask, output_attentions=True)
+
+    # out.attentions is now a list of (batch, heads, seq, seq)
+    attn = out.attentions[-1][0, 0]  # last layer, first head
+
+    print("Attention matrix (last layer, head 0):")
+    print(attn)
+    has_future = bool((attn.triu(1) > 0).any().item())
+    print(f"Has future (bidirectional) attention? {has_future}")
+
 
 
 # ------------------------------- CLI ----------------------------------
@@ -200,10 +245,13 @@ def main():
         print("▶ Launching diffusion training run…")
 
     # model & tok
-    model = AutoModelForCausalLM.from_pretrained(args.load_checkpoint_or_model, torch_dtype=torch.bfloat16)
-    patch_model_for_bidirectional_training(model)
+    model = AutoModelForCausalLM.from_pretrained(args.load_checkpoint_or_model, torch_dtype=torch.bfloat16, attn_implementation="eager")
+    # patch_model_for_bidirectional_training(model)
+    patch_GPT2_model_for_bidirectional_training(model) #patch bidirectional attention for gpt2
     tokenizer = CustomTokenizer.from_pretrained(args.load_checkpoint_or_model)
 
+    check_attention(model, tokenizer) #check the attention matrix
+    
     # special [MASK]
     mask_token = "[MASK]"
     mask_id = tokenizer.convert_tokens_to_ids(mask_token)
