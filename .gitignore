@@ -1,0 +1,9 @@
+data
+outputs
+wandb
+*test.py
+**/__pycache__/
+*.pyc
+*.ipynb
+cache
+mdm*
